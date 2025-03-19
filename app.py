@@ -1,102 +1,149 @@
-from flask import Flask, request, jsonify
 import os
 import cv2
 import numpy as np
+import pickle
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-dataset_path = "dataset/"
-trainer_path = "trainer.yml"
+# Path settings
+DATASET_PATH = "dataset"  # Folder where images are stored
+MODEL_PATH = "face_recognizer.yml"  # Model save path
+LABEL_DICT_PATH = "label_dict.pkl"  # Label dictionary save path
 
-face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+# Initialize Face Recognizer (LBPH)
+recognizer = cv2.face.LBPHFaceRecognizer_create()
 
-# Ensure dataset directory exists
-if not os.path.exists(dataset_path):
-    os.makedirs(dataset_path)
+# Load Haar Cascade for face detection
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
-@app.route('/upload_faces', methods=['POST'])
-def upload_faces():
-    """Receive multiple images for a person and store them."""
-    person_name = request.form.get('name')
-    if not person_name:
-        return jsonify({"error": "Name is required"}), 400
-    
-    person_dir = os.path.join(dataset_path, person_name)
-    if not os.path.exists(person_dir):
-        os.makedirs(person_dir)
-    
-    files = request.files.getlist("images")
-    if not files:
-        return jsonify({"error": "No images received"}), 400
-    
-    for file in files:
-        img_path = os.path.join(person_dir, file.filename)
-        file.save(img_path)
+# Ensure dataset folder exists
+if not os.path.exists(DATASET_PATH):
+    os.makedirs(DATASET_PATH)
 
-    return jsonify({"message": "Images saved for " + person_name}), 200
+# Load label dictionary if it exists
+if os.path.exists(LABEL_DICT_PATH):
+    with open(LABEL_DICT_PATH, "rb") as f:
+        label_dict = pickle.load(f)
+else:
+    label_dict = {}  # Initialize an empty dictionary
 
-@app.route('/train', methods=['GET'])
-def train_model():
-    """Train the LBPH recognizer with stored images."""
-    recognizer = cv2.face.LBPHFaceRecognizer_create()
-    faces, labels = [], []
-    label_map = {}
-    label_count = 0
+# -------------------- 1. Register User (Save Face Images) --------------------
+@app.route("/register", methods=["POST"])
+def register():
+    try:
+        name = request.form["name"]  # User's name
+        image = request.files["image"]  # Uploaded image
 
-    for person_name in os.listdir(dataset_path):
-        person_dir = os.path.join(dataset_path, person_name)
-        for img_name in os.listdir(person_dir):
-            img_path = os.path.join(person_dir, img_name)
-            img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-            img = cv2.resize(img, (200, 200))  # Ensure consistent image size
+        if not name or not image:
+            return jsonify({"error": "Missing name or image"}), 400
+
+        user_folder = os.path.join(DATASET_PATH, name)
+        os.makedirs(user_folder, exist_ok=True)
+
+        img_path = os.path.join(user_folder, f"{len(os.listdir(user_folder)) + 1}.jpg")
+        image.save(img_path)
+
+        return jsonify({"message": f"Image saved as {img_path}"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# -------------------- 2. Train Model --------------------
+def get_training_data():
+    faces = []
+    labels = []
+    label_dict = {}
+    label_id = 0
+
+    if not os.path.exists(DATASET_PATH):
+        return faces, labels, label_dict  # Return empty lists safely
+
+    for person_name in os.listdir(DATASET_PATH):
+        person_folder = os.path.join(DATASET_PATH, person_name)
+        if not os.path.isdir(person_folder):
+            continue
+
+        if person_name not in label_dict:
+            label_dict[person_name] = label_id
+            label_id += 1
+
+        for image_name in os.listdir(person_folder):
+            image_path = os.path.join(person_folder, image_name)
+            img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+
+            if img is None:
+                print(f"Skipping invalid image: {image_path}")
+                continue
+
             faces.append(img)
-            if person_name not in label_map:
-                label_map[person_name] = label_count
-                label_count += 1
-            labels.append(label_map[person_name])
+            labels.append(label_dict[person_name])
 
-    recognizer.train(faces, np.array(labels))
-    recognizer.save(trainer_path)
-    
-    return jsonify({"message": "Training complete", "people_trained": list(label_map.keys())}), 200
+    return faces, labels, label_dict
 
-@app.route('/detect', methods=['POST'])
-def detect_face():
-    """Detect a face in an uploaded image and return the closest trained match."""
-    if not os.path.exists(trainer_path):
-        return jsonify({"error": "Model not trained yet"}), 400
-
-    file = request.files['image']
-    nparr = np.frombuffer(file.read(), np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    recognizer = cv2.face.LBPHFaceRecognizer_create()
-    recognizer.read(trainer_path)
-
-    faces = face_detector.detectMultiScale(gray, 1.2, 5)
+@app.route("/train", methods=["POST"])
+def train():
+    faces, labels, label_dict = get_training_data()
 
     if len(faces) == 0:
-        return jsonify({"message": "No face detected"}), 400
+        return jsonify({"error": "No faces found to train"}), 400
 
-    # Correct label mapping
-    label_map = {}
-    for idx, person_name in enumerate(os.listdir(dataset_path)):
-        label_map[idx] = person_name
+    recognizer.train([np.array(face, dtype=np.uint8) for face in faces], np.array(labels))
+    recognizer.save(MODEL_PATH)
 
-    best_match = None
-    best_confidence = float("inf")
+    # Save label dictionary
+    with open(LABEL_DICT_PATH, "wb") as f:
+        pickle.dump(label_dict, f)
 
-    for (x, y, w, h) in faces:
-        face = gray[y:y+h, x:x+w]
-        face = cv2.resize(face, (200, 200))  # Ensure consistent size
-        label, confidence = recognizer.predict(face)
+    return jsonify({"message": "Training completed", "labels": label_dict}), 200
 
-        if confidence < best_confidence:
-            best_confidence = confidence
-            best_match = label_map.get(label, "Unknown")  # Always returns a trained person
+# -------------------- 3. Recognize Face --------------------
+@app.route("/recognize", methods=["POST"])
+def recognize():
+    if "image" not in request.files:
+        return jsonify({"error": "No image uploaded"}), 400
 
-    return jsonify({"recognized": best_match, "confidence": best_confidence}), 200
-if __name__ == '__main__':
-    print("Starting Flask server...")  # Debug message
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    image = request.files["image"]
+    nparr = np.frombuffer(image.read(), np.uint8)
+    img_color = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    img_gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
+
+    if img_gray is None:
+        return jsonify({"error": "Invalid image"}), 400
+
+    if not os.path.exists(MODEL_PATH):
+        return jsonify({"error": "Model not trained"}), 500
+
+    # Load the label dictionary
+    if not os.path.exists(LABEL_DICT_PATH):
+        return jsonify({"error": "Label dictionary not found"}), 500
+
+    with open(LABEL_DICT_PATH, "rb") as f:
+        label_dict = pickle.load(f)
+
+    # Create reverse mapping (label to name)
+    name_dict = {v: k for k, v in label_dict.items()}
+
+    recognizer.read(MODEL_PATH)
+
+    faces_detected = face_cascade.detectMultiScale(img_gray, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
+
+    if len(faces_detected) == 0:
+        return jsonify({"message": "No face detected"}), 404
+
+    results = []
+    for (x, y, w, h) in faces_detected:
+        face_roi = img_gray[y:y+h, x:x+w]
+
+        try:
+            label, confidence = recognizer.predict(face_roi)
+            # Convert label to name
+            name = name_dict.get(label, "Unknown")
+            results.append({"name": name, "confidence": confidence})
+        except Exception as e:
+            print(f"Recognition error: {e}")
+            results.append({"name": "Error", "confidence": None})
+
+    return jsonify({"recognized_faces": results}), 200
+
+if __name__ == "__main__":
+    app.run(debug=True)
