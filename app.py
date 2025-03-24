@@ -27,6 +27,9 @@ if os.path.exists(LABEL_DICT_PATH):
         label_dict = pickle.load(f)
 else:
     label_dict = {}  # Initialize an empty dictionary
+@app.route('/')
+def home():
+    return "Face Recognition API is running!"
 
 # -------------------- 1. Register User (Save Face Images) --------------------
 @app.route("/register", methods=["POST"])
